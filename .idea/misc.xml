@@ -1,4 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
+<<<<<<< HEAD
   <component name="ProjectRootManager" version="2" project-jdk-name="SLAM" project-jdk-type="Python SDK" />
+=======
+  <component name="Black">
+    <option name="sdkName" value="robotics_final" />
+  </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="robotics_final" project-jdk-type="Python SDK" />
+>>>>>>> 3235dc520feaf136fa257b6b9fe3060b519403ef
 </project>
