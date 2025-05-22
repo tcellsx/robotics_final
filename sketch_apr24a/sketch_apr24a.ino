@@ -1,0 +1,425 @@
+// Drum Robot Control Program - Near-Simultaneous Drumming Version
+// Uses minimal time differences between servo movements to simulate simultaneous drumming
+// Drum patterns are directly hardcoded in the code
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_NeoPixel.h>
+#include <SCServo.h>
+
+// Basic settings
+#define S_RXD 18
+#define S_TXD 19
+#define S_SCL 22
+#define S_SDA 21
+#define RGB_LED 23
+#define NUMPIXELS 10
+#define MAX_ID 20
+
+// Timing settings
+#define HIT_DELAY 15      // Delay between servos when striking (ms)
+#define RETURN_DELAY 15   // Delay before returning to start position (ms)
+
+#if CONFIG_FREERTOS_UNICORE
+#define ARDUINO_RUNNING_CORE 0
+#else
+#define ARDUINO_RUNNING_CORE 1
+#endif
+
+// ==================== Global Variable Definitions (Easy to Modify) ====================
+// Servo motor parameters - Adjustable as needed
+struct ServoConfig {
+  int id;              // Servo ID
+  int startPosition;   // Start position (0-4095)
+  int endPosition;     // Strike position (0-4095)
+  int strikeSpeed;     // Strike speed (0-4000)
+  int returnSpeed;     // Return speed (0-4000)
+  int delayAfterHit;   // Delay after hit (ms)
+};
+
+// Configuration parameters for three servo motors
+ServoConfig kickConfig = {3, 1900, 900, 4000, 800, RETURN_DELAY};   // Kick drum (ID 3)
+ServoConfig snareConfig = {7, 1800, 2500, 4500, 800, RETURN_DELAY};  // Snare drum (ID 7)
+ServoConfig hihatConfig = {1, 1600, 500, 4500, 800, RETURN_DELAY};  // Hi-hat (ID 1)
+
+// Beat and playback related settings
+int beatsPerMinute = 120;  // Tempo in BPM
+int beatDivision = 4;      // Beat division (4 = 16th notes)
+int patternLength = 16;    // Pattern length in steps
+// ==================== End of Global Variable Definitions ====================
+
+// ==================== Hardcoded Drum Patterns ====================
+// These patterns are extracted from JSON file and hardcoded
+// Can be modified as needed to change drum patterns
+// 1 means hit, 0 means no hit
+const bool kickPatternData[16] = {1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0};
+const bool snarePatternData[16] = {0,1,0,1,0,1,0,1,0,1,1,1,1,1,1,1};
+const bool hihatPatternData[16] = {0,0,0,0,0,1,0,1,0,0,1,0,0,0,0,0};
+// ==================== End of Hardcoded Drum Patterns ====================
+
+// Screen definition
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// RGB LED definition
+Adafruit_NeoPixel pixels(NUMPIXELS, RGB_LED, NEO_GRB + NEO_KHZ800);
+
+// Servo motor control
+SMS_STS st;
+
+// Arrays to store drum patterns
+bool kickPattern[16];
+bool snarePattern[16];
+bool hihatPattern[16];
+
+// Current playback status
+int currentBeat = 0;
+unsigned long lastBeatTime = 0;
+
+// Servo motor type settings and status tracking
+int ServoType[MAX_ID + 1];
+s16 posRead[MAX_ID + 1];
+
+// Function declarations
+void initServos();
+void initDisplay();
+void initRGB();
+void loadPatternFromHardcoded();
+void resetDrums();
+void testDrums();
+void hitDrumStrike(ServoConfig &drum);
+void hitDrumReturn(ServoConfig &drum);
+void updateDisplay();
+void drumPlayTask(void * parameter);
+
+// Load drum patterns from hardcoded data
+void loadPatternFromHardcoded() {
+  Serial.println("Loading hardcoded drum patterns");
+  
+  // Copy drum pattern data to runtime arrays
+  for (int i = 0; i < patternLength; i++) {
+    kickPattern[i] = kickPatternData[i];
+    snarePattern[i] = snarePatternData[i];
+    hihatPattern[i] = hihatPatternData[i];
+  }
+  
+  // Print loaded patterns (for debugging)
+  Serial.println("Successfully loaded drum patterns:");
+  for (int i = 0; i < patternLength; i++) {
+    Serial.print("Beat ");
+    Serial.print(i);
+    Serial.print(": Kick(ID 3)=");
+    Serial.print(kickPattern[i]);
+    Serial.print(", Snare(ID 7)=");
+    Serial.print(snarePattern[i]);
+    Serial.print(", HiHat(ID 1)=");
+    Serial.println(hihatPattern[i]);
+  }
+}
+
+// Initialize servo motors
+void initServos() {
+  Serial.println("Initializing servo motors...");
+  
+  // Set up servo serial communication
+  Serial1.begin(1000000, SERIAL_8N1, S_RXD, S_TXD);
+  st.pSerial = &Serial1;
+  
+  // Wait for serial port to be ready
+  while (!Serial1) {
+    delay(10);
+  }
+  
+  // Initialize servo types
+  for (int i = 0; i <= MAX_ID; i++) {
+    ServoType[i] = -1;
+  }
+  
+  // Set servo types to ST (9)
+  ServoType[kickConfig.id] = 9;   // Kick drum ID 3
+  ServoType[snareConfig.id] = 9;  // Snare drum ID 7
+  ServoType[hihatConfig.id] = 9;  // Hi-hat ID 1
+  
+  Serial.println("Servo motors initialized");
+}
+
+// Initialize RGB LED
+void initRGB() {
+  Serial.println("Initializing RGB LEDs...");
+  
+  pixels.begin();
+  pixels.clear();
+  
+  // Show blue color at startup
+  for (int i = 0; i < NUMPIXELS; i++) {
+    pixels.setPixelColor(i, pixels.Color(0, 0, 128));
+  }
+  pixels.show();
+  
+  Serial.println("RGB LEDs initialized");
+}
+
+// Initialize OLED display
+void initDisplay() {
+  Serial.println("Initializing display...");
+  
+  Wire.begin(S_SDA, S_SCL);
+  
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 initialization failed");
+    for (;;); // Enter infinite loop if initialization fails
+  }
+  
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(2);
+  display.setCursor(10, 10);
+  display.println("DRUM BOT");
+  display.setTextSize(1);
+  display.setCursor(20, 35);
+  display.println("Initializing...");
+  display.display();
+  delay(1000); // Show startup screen for 1 second
+  
+  Serial.println("Display initialized");
+}
+
+// Reset all drums to starting position
+void resetDrums() {
+  Serial.println("Resetting all drums to starting position...");
+  
+  // Reset kick drum (ID 3)
+  st.WritePosEx(kickConfig.id, kickConfig.startPosition, 100, 0);
+  delay(300);
+  
+  // Reset snare drum (ID 7)
+  st.WritePosEx(snareConfig.id, snareConfig.startPosition, 100, 0);
+  delay(300);
+  
+  // Reset hi-hat (ID 1)
+  st.WritePosEx(hihatConfig.id, hihatConfig.startPosition, 100, 0);
+  delay(300);
+  
+  Serial.println("All drums reset");
+}
+
+// Strike action - Only moves to strike position
+void hitDrumStrike(ServoConfig &drum) {
+  // Move quickly to strike position
+  st.WritePosEx(drum.id, drum.endPosition, drum.strikeSpeed, 0);
+}
+
+// Return action - Only moves back to start position
+void hitDrumReturn(ServoConfig &drum) {
+  // Return to start position
+  st.WritePosEx(drum.id, drum.startPosition, drum.returnSpeed, 0);
+}
+
+// Test all drums - Strike and return actions are separate
+void testDrums() {
+  Serial.println("Testing all drums...");
+  
+  // Test kick drum (ID 3)
+  Serial.println("Testing kick drum (ID 3)...");
+  hitDrumStrike(kickConfig);
+  delay(kickConfig.delayAfterHit);
+  hitDrumReturn(kickConfig);
+  delay(500);
+  
+  // Test snare drum (ID 7)
+  Serial.println("Testing snare drum (ID 7)...");
+  hitDrumStrike(snareConfig);
+  delay(snareConfig.delayAfterHit);
+  hitDrumReturn(snareConfig);
+  delay(500);
+  
+  // Test hi-hat (ID 1)
+  Serial.println("Testing hi-hat (ID 1)...");
+  hitDrumStrike(hihatConfig);
+  delay(hihatConfig.delayAfterHit);
+  hitDrumReturn(hihatConfig);
+  delay(500);
+  
+  Serial.println("Testing complete");
+}
+
+// Set RGB color
+void setRGBColor(uint8_t r, uint8_t g, uint8_t b) {
+  for (int i = 0; i < NUMPIXELS; i++) {
+    pixels.setPixelColor(i, pixels.Color(r, g, b));
+  }
+  pixels.show();
+}
+
+// Update display
+void updateDisplay() {
+  display.clearDisplay();
+  
+  // Show title
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.println("PLAYING");
+  
+  // Show current tempo
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  display.print("Tempo: ");
+  display.print(beatsPerMinute);
+  display.println(" BPM");
+  
+  // Show current beat
+  display.setCursor(0, 30);
+  display.print("Beat: ");
+  display.print(currentBeat + 1);
+  display.print("/");
+  display.println(patternLength);
+  
+  // Show drum pattern (simplified graphical representation)
+  display.setCursor(0, 40);
+  display.println("Pattern:");
+  
+  // Draw pattern grid
+  const int patternY = 50;
+  const int beatWidth = 6;
+  const int beatSpacing = 8;
+  
+  for (int i = 0; i < patternLength && i < 16; i++) {
+    int x = i * beatSpacing;
+    
+    // Only draw the first 16 beats to avoid exceeding the screen width
+    if (x + beatWidth > SCREEN_WIDTH) break;
+    
+    // Highlight current beat
+    if (i == currentBeat) {
+      display.fillRect(x, patternY - 2, beatWidth, 16, WHITE);
+      
+      // Show drum hits as black on white background for current beat
+      if (kickPattern[i]) display.fillRect(x + 1, patternY, 4, 3, BLACK);
+      if (snarePattern[i]) display.fillRect(x + 1, patternY + 5, 4, 3, BLACK);
+      if (hihatPattern[i]) display.fillRect(x + 1, patternY + 10, 4, 3, BLACK);
+    }
+    else {
+      // Show drum hits as white on black background for other beats
+      if (kickPattern[i]) display.fillRect(x, patternY, 6, 3, WHITE);
+      if (snarePattern[i]) display.fillRect(x, patternY + 5, 6, 3, WHITE);
+      if (hihatPattern[i]) display.fillRect(x, patternY + 10, 6, 3, WHITE);
+    }
+  }
+  
+  display.display();
+}
+
+// Core task for playing drum patterns - Uses minimal delays for near-simultaneous drumming
+void drumPlayTask(void * parameter) {
+  // Wait 2 seconds before starting playback
+  delay(2000);
+  
+  // Start playback
+  lastBeatTime = millis();
+  
+  for (;;) {
+    unsigned long currentTime = millis();
+    unsigned long beatInterval = 60000 / (beatsPerMinute * beatDivision / 4);
+    
+    if (currentTime - lastBeatTime >= beatInterval) {
+      lastBeatTime = currentTime;
+      
+      // Get current beat pattern
+      bool doKick = kickPattern[currentBeat];
+      bool doSnare = snarePattern[currentBeat];
+      bool doHihat = hihatPattern[currentBeat];
+      
+      // Set LED color based on drum priority
+      if (doKick) {
+        setRGBColor(255, 0, 0); // Red for kick drum
+      } else if (doSnare) {
+        setRGBColor(0, 255, 0); // Green for snare drum
+      } else if (doHihat) {
+        setRGBColor(0, 0, 255); // Blue for hi-hat
+      } else {
+        setRGBColor(32, 32, 32); // Dim white for no hits
+      }
+      
+      // Step 1: Send all strike commands in sequence with minimal delays
+      if (doKick) hitDrumStrike(kickConfig);
+      delay(HIT_DELAY);  // Minimal delay
+      
+      if (doSnare) hitDrumStrike(snareConfig);
+      delay(HIT_DELAY);  // Minimal delay
+      
+      if (doHihat) hitDrumStrike(hihatConfig);
+      
+      // Step 2: Wait for strike actions to complete
+      delay(RETURN_DELAY);
+      
+      // Step 3: Send all return commands in sequence with minimal delays
+      if (doKick) hitDrumReturn(kickConfig);
+      delay(HIT_DELAY);  // Minimal delay
+      
+      if (doSnare) hitDrumReturn(snareConfig);
+      delay(HIT_DELAY);  // Minimal delay
+      
+      if (doHihat) hitDrumReturn(hihatConfig);
+      
+      // Update current beat
+      currentBeat = (currentBeat + 1) % patternLength;
+      
+      // Update display
+      updateDisplay();
+    }
+    
+    delay(5); // Short delay to reduce CPU usage
+  }
+}
+
+// Initialize thread
+void initThread() {
+  xTaskCreatePinnedToCore(
+    drumPlayTask,
+    "DrumPlayTask",
+    10000,
+    NULL,
+    1,
+    NULL,
+    ARDUINO_RUNNING_CORE
+  );
+}
+
+void setup() {
+  // Initialize serial communication
+  Serial.begin(115200);
+  
+  // Wait for serial port to be ready
+  delay(1000);
+  Serial.println("\n\n--- Drum Robot Starting ---");
+  
+  // Initialize all components
+  initRGB();
+  initDisplay();
+  initServos();
+  
+  // Reset all drums to starting position
+  resetDrums();
+  
+  // Load hardcoded drum patterns
+  loadPatternFromHardcoded();
+  
+  // Test all drums
+  testDrums();
+  
+  // Start playback thread
+  initThread();
+  
+  // Update display
+  updateDisplay();
+  
+  Serial.println("Drum robot playback started...");
+}
+
+void loop() {
+  // Main loop does nothing, all functionality is in the drumPlayTask thread
+  delay(100);
+}
